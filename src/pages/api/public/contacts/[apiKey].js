@@ -54,27 +54,48 @@ export default async function handler(req, res) {
 
         // Check allowed domains (origin/referer validation)
         if (contactList.allowedDomains && contactList.allowedDomains.length > 0) {
-            const origin = req.headers.origin || req.headers.referer || '';
+            const origin = req.headers.origin || req.headers.referer;
+
+            // Require origin/referer header when domain restrictions are configured
+            if (!origin) {
+                return res.status(403).json({
+                    success: false,
+                    message: 'Origin or Referer header is required',
+                });
+            }
 
             let requestDomain = '';
             try {
                 const url = new URL(origin);
-                requestDomain = url.hostname;
+                requestDomain = url.hostname.toLowerCase();
             } catch (e) {
-                if (!origin.includes('localhost') && !origin.includes('127.0.0.1')) {
-                    return res.status(403).json({
-                        success: false,
-                        message: 'Requests from this domain are not allowed',
-                    });
-                }
+                // Reject invalid origin URLs
+                return res.status(403).json({
+                    success: false,
+                    message: 'Invalid origin or referer header',
+                });
             }
 
+            // Perform exact domain or subdomain matching
             const isAllowed = contactList.allowedDomains.some((domain) => {
-                const cleanDomain = domain.replace(/^https?:\/\//, '').replace(/\/$/, '');
-                return requestDomain.includes(cleanDomain) || cleanDomain.includes(requestDomain);
+                const cleanDomain = domain.replace(/^https?:\/\//, '').replace(/\/$/, '').toLowerCase();
+                // Extract hostname if domain includes path
+                const domainHostname = cleanDomain.split('/')[0];
+                
+                // Exact match
+                if (requestDomain === domainHostname) {
+                    return true;
+                }
+                
+                // Subdomain match: requestDomain must end with .domainHostname
+                if (requestDomain.endsWith('.' + domainHostname)) {
+                    return true;
+                }
+                
+                return false;
             });
 
-            if (!isAllowed && requestDomain && !requestDomain.includes('localhost')) {
+            if (!isAllowed) {
                 return res.status(403).json({
                     success: false,
                     message: 'Requests from this domain are not allowed',
@@ -116,22 +137,38 @@ export default async function handler(req, res) {
 
         if (existingContact) {
             if (!contactList.apiSettings?.allowDuplicates) {
-                // Optionally update custom fields on existing contact
-                if (Object.keys(sanitizedCustomFields).length > 0) {
-                    existingContact.customFields = {
-                        ...existingContact.customFields,
-                        ...sanitizedCustomFields,
-                    };
-                    existingContact.updatedAt = new Date();
-                    await existingContact.save();
-                }
+                // Update existing contact with new custom fields
+                try {
+                    if (Object.keys(sanitizedCustomFields).length > 0) {
+                        existingContact.customFields = {
+                            ...existingContact.customFields,
+                            ...sanitizedCustomFields,
+                        };
+                        existingContact.updatedAt = new Date();
+                        await existingContact.save();
+                    }
 
+                    return res.status(200).json({
+                        success: true,
+                        message: 'Contact already exists in this list',
+                        contactId: existingContact._id,
+                        duplicate: true,
+                        customFieldsUpdated: Object.keys(sanitizedCustomFields).length > 0,
+                    });
+                } catch (updateError) {
+                    console.error('Error updating existing contact:', updateError);
+                    return res.status(500).json({
+                        success: false,
+                        message: 'Failed to update existing contact. Please try again.',
+                    });
+                }
+            } else {
+                // Duplicates allowed, but contact already exists - return existing contact
                 return res.status(200).json({
                     success: true,
                     message: 'Contact already exists in this list',
                     contactId: existingContact._id,
                     duplicate: true,
-                    customFieldsUpdated: Object.keys(sanitizedCustomFields).length > 0,
                 });
             }
         }
@@ -153,11 +190,16 @@ export default async function handler(req, res) {
 
         await contact.save();
 
-        // Update contact count in the list
+        // Recalculate contact count from actual documents to ensure accuracy
+        const actualCount = await Contact.countDocuments({
+            listId: contactList._id,
+        });
+        // Ensure count is never negative (atomic safeguard)
+        const safeCount = Math.max(0, actualCount);
         await ContactList.updateOne(
             { _id: contactList._id },
             {
-                $inc: { contactCount: 1 },
+                contactCount: safeCount,
                 updatedAt: new Date(),
             }
         );
@@ -174,6 +216,24 @@ export default async function handler(req, res) {
 
         // Handle duplicate key error
         if (error.code === 11000) {
+            // Recalculate count in case of duplicate to ensure accuracy
+            try {
+                const actualCount = await Contact.countDocuments({
+                    listId: contactList._id,
+                });
+                // Ensure count is never negative (atomic safeguard)
+                const safeCount = Math.max(0, actualCount);
+                await ContactList.updateOne(
+                    { _id: contactList._id },
+                    {
+                        contactCount: safeCount,
+                        updatedAt: new Date(),
+                    }
+                );
+            } catch (recalcError) {
+                console.error('Error recalculating contact count:', recalcError);
+            }
+
             return res.status(200).json({
                 success: true,
                 message: 'Contact already exists in this list',

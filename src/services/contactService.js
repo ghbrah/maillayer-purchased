@@ -158,16 +158,31 @@ export async function addContactsToList(listId, brandId, userId, contacts, skipD
 
     // Always check for existing emails, regardless of skipDuplicates setting
     const existingEmails = new Set();
-    const existingContacts = await Contact.find(
-        {
-            listId: new mongoose.Types.ObjectId(listId),
-        },
-        'email'
-    );
+    // Use batching to avoid loading all contacts into memory at once
+    const batchSize = 10000;
+    let skip = 0;
+    let hasMore = true;
 
-    existingContacts.forEach((contact) => {
-        existingEmails.add(contact.email.toLowerCase());
-    });
+    while (hasMore) {
+        const batch = await Contact.find(
+            {
+                listId: new mongoose.Types.ObjectId(listId),
+            },
+            'email'
+        )
+            .skip(skip)
+            .limit(batchSize)
+            .lean();
+
+        batch.forEach((contact) => {
+            if (contact.email) {
+                existingEmails.add(contact.email.toLowerCase());
+            }
+        });
+
+        hasMore = batch.length === batchSize;
+        skip += batchSize;
+    }
 
     // Filter contacts based on duplicates
     const newContacts = [];
@@ -193,11 +208,10 @@ export async function addContactsToList(listId, brandId, userId, contacts, skipD
     // If skipDuplicates is true, we'll add only the new contacts
     // If it&apos; false and there are duplicates, we'll throw an error
     if (!skipDuplicates && duplicateContacts.length > 0) {
-        throw {
-            code: 11000,
-            message: `Found ${duplicateContacts.length} duplicate emails. Set skipDuplicates to true to ignore them.`,
-            duplicates: duplicateContacts.map((c) => c.email),
-        };
+        const error = new Error(`Found ${duplicateContacts.length} duplicate emails. Set skipDuplicates to true to ignore them.`);
+        error.code = 11000;
+        error.duplicates = duplicateContacts.map((c) => c.email);
+        throw error;
     }
 
     // Insert the new contacts
@@ -206,10 +220,38 @@ export async function addContactsToList(listId, brandId, userId, contacts, skipD
             const result = await Contact.insertMany(newContacts);
             importResult.imported = result.length;
 
-            // Update the contact count in the list
-            await ContactList.updateOne({ _id: new mongoose.Types.ObjectId(listId) }, { $inc: { contactCount: result.length }, updatedAt: new Date() });
+            // Recalculate contact count from actual documents to ensure accuracy
+            const actualCount = await Contact.countDocuments({
+                listId: new mongoose.Types.ObjectId(listId),
+            });
+            // Ensure count is never negative (atomic safeguard)
+            const safeCount = Math.max(0, actualCount);
+            await ContactList.updateOne(
+                { _id: new mongoose.Types.ObjectId(listId) },
+                {
+                    contactCount: safeCount,
+                    updatedAt: new Date(),
+                }
+            );
         } catch (error) {
             console.error('Error inserting contacts:', error);
+            // Recalculate count even on error to ensure accuracy
+            try {
+                const actualCount = await Contact.countDocuments({
+                    listId: new mongoose.Types.ObjectId(listId),
+                });
+                // Ensure count is never negative (atomic safeguard)
+                const safeCount = Math.max(0, actualCount);
+                await ContactList.updateOne(
+                    { _id: new mongoose.Types.ObjectId(listId) },
+                    {
+                        contactCount: safeCount,
+                        updatedAt: new Date(),
+                    }
+                );
+            } catch (recalcError) {
+                console.error('Error recalculating contact count:', recalcError);
+            }
             throw error;
         }
     }
@@ -231,9 +273,20 @@ export async function deleteContactsFromList(listId, brandId, userId, contactIds
         brandId: new mongoose.Types.ObjectId(brandId),
     });
 
-    // Update the contact count in the list
+    // Recalculate contact count from actual documents to ensure accuracy
     if (result.deletedCount > 0) {
-        await ContactList.updateOne({ _id: new mongoose.Types.ObjectId(listId) }, { $inc: { contactCount: -result.deletedCount }, updatedAt: new Date() });
+        const actualCount = await Contact.countDocuments({
+            listId: new mongoose.Types.ObjectId(listId),
+        });
+        // Ensure count is never negative (atomic safeguard)
+        const safeCount = Math.max(0, actualCount);
+        await ContactList.updateOne(
+            { _id: new mongoose.Types.ObjectId(listId) },
+            {
+                contactCount: safeCount,
+                updatedAt: new Date(),
+            }
+        );
     }
 
     return {

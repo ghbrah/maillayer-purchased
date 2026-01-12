@@ -20,9 +20,21 @@ export function buildSegmentQuery(segment, brandId, additionalFilters = {}) {
 
     // If static segment, just return contacts in the list
     if (segment.type === 'static') {
+        // Validate and convert staticContactIds to ObjectIds
+        const staticIds = Array.isArray(segment.staticContactIds)
+            ? segment.staticContactIds
+                  .map((id) => {
+                      try {
+                          return new mongoose.Types.ObjectId(id);
+                      } catch (e) {
+                          return null;
+                      }
+                  })
+                  .filter(Boolean)
+            : [];
         return {
             ...baseQuery,
-            _id: { $in: segment.staticContactIds },
+            _id: { $in: staticIds },
         };
     }
 
@@ -45,9 +57,26 @@ export function buildSegmentQuery(segment, brandId, additionalFilters = {}) {
     };
 }
 
+// Escape special regex characters
+function escapeRegex(string) {
+    if (!string) return '';
+    return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 // Convert a single rule to MongoDB query
 function buildRuleQuery(rule) {
     const { field, operator, value } = rule;
+
+    // Validate required fields
+    if (!field || !operator) {
+        return {};
+    }
+
+    // Some operators require a value
+    const valueRequiredOps = ['equals', 'not_equals', 'contains', 'not_contains', 'starts_with', 'ends_with', 'greater_than', 'less_than', 'before', 'after', 'has_tag', 'missing_tag', 'has_any_tag', 'has_all_tags', 'in', 'not_in'];
+    if (valueRequiredOps.includes(operator) && (value === undefined || value === null)) {
+        return {}; // Skip invalid rules
+    }
 
     // Handle different field types
     const fieldPath = field.startsWith('customFields.') ? field : field;
@@ -60,16 +89,16 @@ function buildRuleQuery(rule) {
             return { [fieldPath]: { $ne: value } };
 
         case 'contains':
-            return { [fieldPath]: { $regex: value, $options: 'i' } };
+            return { [fieldPath]: { $regex: escapeRegex(value), $options: 'i' } };
 
         case 'not_contains':
-            return { [fieldPath]: { $not: { $regex: value, $options: 'i' } } };
+            return { [fieldPath]: { $not: { $regex: escapeRegex(value), $options: 'i' } } };
 
         case 'starts_with':
-            return { [fieldPath]: { $regex: `^${value}`, $options: 'i' } };
+            return { [fieldPath]: { $regex: `^${escapeRegex(value)}`, $options: 'i' } };
 
         case 'ends_with':
-            return { [fieldPath]: { $regex: `${value}$`, $options: 'i' } };
+            return { [fieldPath]: { $regex: `${escapeRegex(value)}$`, $options: 'i' } };
 
         case 'greater_than':
             return { [fieldPath]: { $gt: value } };
@@ -100,10 +129,18 @@ function buildRuleQuery(rule) {
             };
 
         case 'before':
-            return { [fieldPath]: { $lt: new Date(value) } };
+            const beforeDate = new Date(value);
+            if (isNaN(beforeDate.getTime())) {
+                return {}; // Reject invalid dates
+            }
+            return { [fieldPath]: { $lt: beforeDate } };
 
         case 'after':
-            return { [fieldPath]: { $gt: new Date(value) } };
+            const afterDate = new Date(value);
+            if (isNaN(afterDate.getTime())) {
+                return {}; // Reject invalid dates
+            }
+            return { [fieldPath]: { $gt: afterDate } };
 
         default:
             return {};

@@ -116,11 +116,21 @@ ContactSchema.pre('save', function (next) {
 });
 
 ContactSchema.pre('save', function (next) {
-    if (this.status === 'unsubscribed' && !this.isUnsubscribed) {
-        this.isUnsubscribed = true;
-        this.unsubscribedAt = this.unsubscribedAt || new Date();
-    } else if (this.status !== 'unsubscribed' && this.isUnsubscribed) {
-        this.status = 'unsubscribed';
+    // Treat status === 'unsubscribed' as the single source of truth
+    if (this.status === 'unsubscribed') {
+        // Ensure isUnsubscribed is synchronized
+        if (!this.isUnsubscribed) {
+            this.isUnsubscribed = true;
+        }
+        // Set unsubscribedAt exactly once when transitioning to unsubscribed
+        if (!this.unsubscribedAt) {
+            this.unsubscribedAt = new Date();
+        }
+    } else {
+        // If status is not unsubscribed, ensure isUnsubscribed is false
+        if (this.isUnsubscribed) {
+            this.isUnsubscribed = false;
+        }
     }
     next();
 });

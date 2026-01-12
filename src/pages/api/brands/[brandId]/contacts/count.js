@@ -22,9 +22,21 @@ function buildSegmentQuery(segment, brandId) {
     }
 
     if (segment.type === 'static') {
+        // Validate and convert staticContactIds to ObjectIds
+        const staticIds = Array.isArray(segment.staticContactIds)
+            ? segment.staticContactIds
+                  .map((id) => {
+                      try {
+                          return new mongoose.Types.ObjectId(id);
+                      } catch (e) {
+                          return null;
+                      }
+                  })
+                  .filter(Boolean)
+            : [];
         return {
             ...baseQuery,
-            _id: { $in: segment.staticContactIds || [] },
+            _id: { $in: staticIds },
         };
     }
 
@@ -53,6 +65,17 @@ function escapeRegex(string) {
 
 function buildRuleQuery(rule) {
     const { field, operator, value, customFieldName } = rule;
+
+    // Validate required fields
+    if (!field || !operator) {
+        return {};
+    }
+
+    // Some operators require a value
+    const valueRequiredOps = ['equals', 'not_equals', 'contains', 'not_contains', 'starts_with', 'ends_with', 'greater_than', 'less_than', 'before', 'after', 'has_tag', 'missing_tag', 'has_any_tag', 'has_all_tags', 'in', 'not_in'];
+    if (valueRequiredOps.includes(operator) && (value === undefined || value === null)) {
+        return {}; // Skip invalid rules
+    }
 
     // Determine the actual field path
     let fieldPath = field;
@@ -90,9 +113,17 @@ function buildRuleQuery(rule) {
         case 'has_all_tags':
             return { tags: { $all: Array.isArray(value) ? value : [value] } };
         case 'before':
-            return { [fieldPath]: { $lt: new Date(value) } };
+            const beforeDate = new Date(value);
+            if (isNaN(beforeDate.getTime())) {
+                return {}; // Reject invalid dates
+            }
+            return { [fieldPath]: { $lt: beforeDate } };
         case 'after':
-            return { [fieldPath]: { $gt: new Date(value) } };
+            const afterDate = new Date(value);
+            if (isNaN(afterDate.getTime())) {
+                return {}; // Reject invalid dates
+            }
+            return { [fieldPath]: { $gt: afterDate } };
         case 'is_empty':
             return {
                 $or: [{ [fieldPath]: { $exists: false } }, { [fieldPath]: null }, { [fieldPath]: '' }, { [fieldPath]: [] }],

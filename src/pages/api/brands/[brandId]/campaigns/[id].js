@@ -27,9 +27,21 @@ function buildSegmentQuery(segment, brandId, additionalFilters = {}) {
 
     // If static segment, just return contacts in the list
     if (segment.type === 'static') {
+        // Validate and convert staticContactIds to ObjectIds
+        const staticIds = Array.isArray(segment.staticContactIds)
+            ? segment.staticContactIds
+                  .map((id) => {
+                      try {
+                          return new mongoose.Types.ObjectId(id);
+                      } catch (e) {
+                          return null;
+                      }
+                  })
+                  .filter(Boolean)
+            : [];
         return {
             ...baseQuery,
-            _id: { $in: segment.staticContactIds || [] },
+            _id: { $in: staticIds },
         };
     }
 
@@ -56,6 +68,17 @@ function buildSegmentQuery(segment, brandId, additionalFilters = {}) {
 function buildRuleQuery(rule) {
     const { field, operator, value } = rule;
 
+    // Validate required fields
+    if (!field || !operator) {
+        return {};
+    }
+
+    // Some operators require a value
+    const valueRequiredOps = ['equals', 'not_equals', 'contains', 'not_contains', 'starts_with', 'ends_with', 'greater_than', 'less_than', 'before', 'after', 'has_tag', 'missing_tag', 'has_any_tag', 'has_all_tags', 'in', 'not_in'];
+    if (valueRequiredOps.includes(operator) && (value === undefined || value === null)) {
+        return {}; // Skip invalid rules
+    }
+
     // Handle different field types
     const fieldPath = field;
 
@@ -67,10 +90,10 @@ function buildRuleQuery(rule) {
             return { [fieldPath]: { $ne: value } };
 
         case 'contains':
-            return { [fieldPath]: { $regex: value, $options: 'i' } };
+            return { [fieldPath]: { $regex: escapeRegex(value), $options: 'i' } };
 
         case 'not_contains':
-            return { [fieldPath]: { $not: { $regex: value, $options: 'i' } } };
+            return { [fieldPath]: { $not: { $regex: escapeRegex(value), $options: 'i' } } };
 
         case 'starts_with':
             return { [fieldPath]: { $regex: `^${escapeRegex(value)}`, $options: 'i' } };
@@ -85,10 +108,18 @@ function buildRuleQuery(rule) {
             return { [fieldPath]: { $lt: value } };
 
         case 'in':
-            return { [fieldPath]: { $in: Array.isArray(value) ? value : [value] } };
+            const inValues = Array.isArray(value) ? value : [value];
+            if (inValues.length > 1000) {
+                return {}; // Reject excessively large arrays
+            }
+            return { [fieldPath]: { $in: inValues } };
 
         case 'not_in':
-            return { [fieldPath]: { $nin: Array.isArray(value) ? value : [value] } };
+            const notInValues = Array.isArray(value) ? value : [value];
+            if (notInValues.length > 1000) {
+                return {}; // Reject excessively large arrays
+            }
+            return { [fieldPath]: { $nin: notInValues } };
 
         case 'has_tag':
             return { tags: value };
@@ -113,10 +144,18 @@ function buildRuleQuery(rule) {
             };
 
         case 'before':
-            return { [fieldPath]: { $lt: new Date(value) } };
+            const beforeDate = new Date(value);
+            if (isNaN(beforeDate.getTime())) {
+                return {}; // Reject invalid dates
+            }
+            return { [fieldPath]: { $lt: beforeDate } };
 
         case 'after':
-            return { [fieldPath]: { $gt: new Date(value) } };
+            const afterDate = new Date(value);
+            if (isNaN(afterDate.getTime())) {
+                return {}; // Reject invalid dates
+            }
+            return { [fieldPath]: { $gt: afterDate } };
 
         default:
             return {};
@@ -125,6 +164,7 @@ function buildRuleQuery(rule) {
 
 // Escape special regex characters
 function escapeRegex(string) {
+    if (!string) return '';
     return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
@@ -349,36 +389,50 @@ export default async function handler(req, res) {
                         updateData.scheduledAt = new Date(scheduledAt);
                         updateData.segmentIds = effectiveSegmentIds;
 
+                        // Update campaign status first to ensure consistency
+                        const updateSuccess = await updateCampaign(id, brandId, updateData);
+                        if (!updateSuccess) {
+                            return res.status(500).json({ message: 'Failed to update campaign status' });
+                        }
+
                         // Create a delay until the scheduled time
                         const now = new Date();
                         const scheduledTime = new Date(scheduledAt);
                         const delay = Math.max(0, scheduledTime.getTime() - now.getTime());
 
-                        // Add to the scheduler queue
-                        await schedulerQueue.add(
-                            'process-scheduled-campaign',
-                            {
-                                campaignId: campaign._id.toString(),
-                                brandId: brandId.toString(),
-                                userId: userId,
-                                contactListIds: effectiveListIds.map((id) => id.toString()),
-                                segmentIds: effectiveSegmentIds.map((id) => id.toString()), // NEW
-                                fromName: fromName || campaign.fromName || brand.fromName,
-                                fromEmail: fromEmail || campaign.fromEmail || brand.fromEmail,
-                                replyTo: replyTo || campaign.replyTo || campaign.fromEmail,
-                                subject: subject || campaign.subject,
-                            },
-                            {
-                                delay,
-                                jobId: `scheduled-campaign-${campaign._id}-${Date.now()}`,
-                                attempts: 3,
-                                backoff: {
-                                    type: 'exponential',
-                                    delay: 5000,
+                        // Add to the scheduler queue - rollback status if queue fails
+                        try {
+                            await schedulerQueue.add(
+                                'process-scheduled-campaign',
+                                {
+                                    campaignId: campaign._id.toString(),
+                                    brandId: brandId.toString(),
+                                    userId: userId,
+                                    contactListIds: effectiveListIds.map((id) => id.toString()),
+                                    segmentIds: effectiveSegmentIds.map((id) => id.toString()), // NEW
+                                    fromName: fromName || campaign.fromName || brand.fromName,
+                                    fromEmail: fromEmail || campaign.fromEmail || brand.fromEmail,
+                                    replyTo: replyTo || campaign.replyTo || campaign.fromEmail,
+                                    subject: subject || campaign.subject,
                                 },
-                                removeOnComplete: false,
-                            }
-                        );
+                                {
+                                    delay,
+                                    jobId: `scheduled-campaign-${campaign._id}-${Date.now()}`,
+                                    attempts: 3,
+                                    backoff: {
+                                        type: 'exponential',
+                                        delay: 5000,
+                                    },
+                                    removeOnComplete: false,
+                                }
+                            );
+                        } catch (queueError) {
+                            // Rollback campaign status if queue operation fails
+                            await updateCampaign(id, brandId, { status: campaign.status });
+                            throw queueError;
+                        }
+
+                        return res.status(200).json({ message: 'Campaign scheduled successfully' });
                     } else if (scheduleType === 'warmup' && warmupConfig) {
                         // Set the campaign status to warmup
                         updateData.status = 'warmup';
@@ -432,34 +486,6 @@ export default async function handler(req, res) {
                         // Calculate the first batch size (initial batch)
                         const firstBatchSize = Math.min(initialBatchSize, totalRecipients);
 
-                        // Schedule the first batch
-                        await schedulerQueue.add(
-                            'process-warmup-batch',
-                            {
-                                campaignId: campaign._id.toString(),
-                                brandId: brandId.toString(),
-                                userId: userId,
-                                contactListIds: effectiveListIds.map((id) => id.toString()),
-                                segmentIds: effectiveSegmentIds.map((id) => id.toString()), // NEW
-                                fromName: fromName || campaign.fromName || brand.fromName,
-                                fromEmail: fromEmail || campaign.fromEmail || brand.fromEmail,
-                                replyTo: replyTo || campaign.replyTo || campaign.fromEmail,
-                                subject: subject || campaign.subject,
-                                batchSize: firstBatchSize,
-                                warmupStage: 0,
-                            },
-                            {
-                                delay: warmupStartDate.getTime() - Date.now(),
-                                jobId: `warmup-campaign-${campaign._id}-batch-0-${Date.now()}`,
-                                attempts: 3,
-                                backoff: {
-                                    type: 'exponential',
-                                    delay: 5000,
-                                },
-                                removeOnComplete: false,
-                            }
-                        );
-
                         // Update total recipients
                         updateData.totalRecipients = totalRecipients;
 
@@ -469,6 +495,48 @@ export default async function handler(req, res) {
                             recipients: totalRecipients,
                             processed: 0,
                         };
+
+                        // Update campaign status first to ensure consistency
+                        const updateSuccess = await updateCampaign(id, brandId, updateData);
+                        if (!updateSuccess) {
+                            return res.status(500).json({ message: 'Failed to update campaign status' });
+                        }
+
+                        // Schedule the first batch - rollback status if queue fails
+                        try {
+                            await schedulerQueue.add(
+                                'process-warmup-batch',
+                                {
+                                    campaignId: campaign._id.toString(),
+                                    brandId: brandId.toString(),
+                                    userId: userId,
+                                    contactListIds: effectiveListIds.map((id) => id.toString()),
+                                    segmentIds: effectiveSegmentIds.map((id) => id.toString()), // NEW
+                                    fromName: fromName || campaign.fromName || brand.fromName,
+                                    fromEmail: fromEmail || campaign.fromEmail || brand.fromEmail,
+                                    replyTo: replyTo || campaign.replyTo || campaign.fromEmail,
+                                    subject: subject || campaign.subject,
+                                    batchSize: firstBatchSize,
+                                    warmupStage: 0,
+                                },
+                                {
+                                    delay: warmupStartDate.getTime() - Date.now(),
+                                    jobId: `warmup-campaign-${campaign._id}-batch-0-${Date.now()}`,
+                                    attempts: 3,
+                                    backoff: {
+                                        type: 'exponential',
+                                        delay: 5000,
+                                    },
+                                    removeOnComplete: false,
+                                }
+                            );
+                        } catch (queueError) {
+                            // Rollback campaign status if queue operation fails
+                            await updateCampaign(id, brandId, { status: campaign.status });
+                            throw queueError;
+                        }
+
+                        return res.status(200).json({ message: 'Campaign warmup started successfully' });
                     }
                     // Handle immediate sending
                     else if (status === 'sending') {
@@ -485,48 +553,61 @@ export default async function handler(req, res) {
                         updateData.segmentIds = effectiveSegmentIds;
                         updateData.totalRecipients = totalRecipients;
 
-                        // Add to processing queue with comprehensive data
-                        await emailCampaignQueue.add(
-                            'send-campaign',
-                            {
-                                campaignId: campaign._id.toString(),
-                                brandId: brandId.toString(),
-                                userId: userId,
-                                contactListIds: effectiveListIds.map((id) => id.toString()),
-                                segmentIds: effectiveSegmentIds.map((id) => id.toString()), // NEW
-                                fromName: fromName || campaign.fromName || brand.fromName,
-                                fromEmail: fromEmail || campaign.fromEmail || brand.fromEmail,
-                                replyTo: replyTo || campaign.replyTo || campaign.fromEmail,
-                                subject: subject || campaign.subject,
-                            },
-                            {
-                                jobId: `campaign-${campaign._id}-${Date.now()}`,
-                                attempts: 3,
-                                backoff: {
-                                    type: 'exponential',
-                                    delay: 5000,
-                                },
-                                removeOnComplete: false,
-                            }
-                        );
-
                         // Update stats with recipient count
                         updateData.stats = {
                             ...campaign.stats,
                             recipients: totalRecipients,
                         };
+
+                        // Update campaign status first to ensure consistency
+                        const updateSuccess = await updateCampaign(id, brandId, updateData);
+                        if (!updateSuccess) {
+                            return res.status(500).json({ message: 'Failed to update campaign status' });
+                        }
+
+                        // Add to processing queue - rollback status if queue fails
+                        try {
+                            await emailCampaignQueue.add(
+                                'send-campaign',
+                                {
+                                    campaignId: campaign._id.toString(),
+                                    brandId: brandId.toString(),
+                                    userId: userId,
+                                    contactListIds: effectiveListIds.map((id) => id.toString()),
+                                    segmentIds: effectiveSegmentIds.map((id) => id.toString()), // NEW
+                                    fromName: fromName || campaign.fromName || brand.fromName,
+                                    fromEmail: fromEmail || campaign.fromEmail || brand.fromEmail,
+                                    replyTo: replyTo || campaign.replyTo || campaign.fromEmail,
+                                    subject: subject || campaign.subject,
+                                },
+                                {
+                                    jobId: `campaign-${campaign._id}-${Date.now()}`,
+                                    attempts: 3,
+                                    backoff: {
+                                        type: 'exponential',
+                                        delay: 5000,
+                                    },
+                                    removeOnComplete: false,
+                                }
+                            );
+                        } catch (queueError) {
+                            // Rollback campaign status if queue operation fails
+                            await updateCampaign(id, brandId, { status: campaign.status });
+                            throw queueError;
+                        }
+
+                        return res.status(200).json({ message: 'Campaign queued successfully' });
                     }
                 } else if (status) {
                     // For other status updates that aren't sending or scheduling
                     updateData.status = status;
-                }
+                    const success = await updateCampaign(id, brandId, updateData);
 
-                const success = await updateCampaign(id, brandId, updateData);
-
-                if (success) {
-                    return res.status(200).json({ message: 'Campaign updated successfully' });
-                } else {
-                    return res.status(500).json({ message: 'Failed to update campaign' });
+                    if (success) {
+                        return res.status(200).json({ message: 'Campaign updated successfully' });
+                    } else {
+                        return res.status(500).json({ message: 'Failed to update campaign' });
+                    }
                 }
             } catch (error) {
                 console.error('Error updating campaign:', error);

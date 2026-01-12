@@ -5,6 +5,7 @@ import connectToDatabase from '@/lib/mongodb';
 import { getBrandById } from '@/services/brandService';
 import { getContactListById } from '@/services/contactService';
 import Contact from '@/models/Contact';
+import ContactList from '@/models/ContactList';
 import mongoose from 'mongoose';
 import { checkBrandPermission, PERMISSIONS } from '@/lib/authorization';
 
@@ -203,11 +204,10 @@ export default async function handler(req, res) {
             // If skipDuplicates is true, we'll add only the new contacts
             // If it's false and there are duplicates, we'll throw an error
             if (!skipDuplicates && duplicateContacts.length > 0) {
-                throw {
-                    code: 11000,
-                    message: `Found ${duplicateContacts.length} duplicate emails. Set skipDuplicates to true to ignore them.`,
-                    duplicates: duplicateContacts.map((c) => c.email),
-                };
+                const error = new Error(`Found ${duplicateContacts.length} duplicate emails. Set skipDuplicates to true to ignore them.`);
+                error.code = 11000;
+                error.duplicates = duplicateContacts.map((c) => c.email);
+                throw error;
             }
 
             // Insert the new contacts
@@ -216,16 +216,38 @@ export default async function handler(req, res) {
                     const result = await Contact.insertMany(newContactsToInsert);
                     importResult.imported = result.length;
 
-                    // Update the contact count in the list
-                    await getContactListById(listId, brandId, userId).then((list) => {
-                        if (list) {
-                            list.contactCount = (list.contactCount || 0) + result.length;
-                            list.updatedAt = new Date();
-                            return list.save();
-                        }
+                    // Recalculate contact count from actual documents to ensure accuracy
+                    const actualCount = await Contact.countDocuments({
+                        listId: new mongoose.Types.ObjectId(listId),
                     });
+                    // Ensure count is never negative (atomic safeguard)
+                    const safeCount = Math.max(0, actualCount);
+                    await ContactList.updateOne(
+                        { _id: new mongoose.Types.ObjectId(listId) },
+                        {
+                            contactCount: safeCount,
+                            updatedAt: new Date(),
+                        }
+                    );
                 } catch (error) {
                     console.log('Error inserting contacts:', error);
+                    // Recalculate count even on error to ensure accuracy
+                    try {
+                        const actualCount = await Contact.countDocuments({
+                            listId: new mongoose.Types.ObjectId(listId),
+                        });
+                        // Ensure count is never negative (atomic safeguard)
+                        const safeCount = Math.max(0, actualCount);
+                        await ContactList.updateOne(
+                            { _id: new mongoose.Types.ObjectId(listId) },
+                            {
+                                contactCount: safeCount,
+                                updatedAt: new Date(),
+                            }
+                        );
+                    } catch (recalcError) {
+                        console.error('Error recalculating contact count:', recalcError);
+                    }
                     throw error;
                 }
             }
@@ -257,15 +279,20 @@ export default async function handler(req, res) {
                 userId: new mongoose.Types.ObjectId(userId),
             });
 
-            // Update the contact count in the list
+            // Recalculate contact count from actual documents to ensure accuracy
             if (result.deletedCount > 0) {
-                await getContactListById(listId, brandId, userId).then((list) => {
-                    if (list) {
-                        list.contactCount = Math.max(0, (list.contactCount || 0) - result.deletedCount);
-                        list.updatedAt = new Date();
-                        return list.save();
-                    }
+                const actualCount = await Contact.countDocuments({
+                    listId: new mongoose.Types.ObjectId(listId),
                 });
+                // Ensure count is never negative (atomic safeguard)
+                const safeCount = Math.max(0, actualCount);
+                await ContactList.updateOne(
+                    { _id: new mongoose.Types.ObjectId(listId) },
+                    {
+                        contactCount: safeCount,
+                        updatedAt: new Date(),
+                    }
+                );
             }
 
             return res.status(200).json({
